@@ -1834,6 +1834,14 @@ class CommonTemplate:
 
         self.common(fn, (x, y, 2))
 
+    def test_polar(self):
+        def fn(abs_, angle):
+            return torch.polar(abs_, angle)
+
+        abs_ = torch.tensor([1.0, 2.0, 0.5, 3.0])
+        angle = torch.tensor([0.0, 1.5708, 3.14159, -0.7854])
+        self.common(fn, (abs_, angle))
+
     def test_add_complex3(self):
         # fix https://github.com/pytorch/pytorch/issues/115071
         @torch.compile
