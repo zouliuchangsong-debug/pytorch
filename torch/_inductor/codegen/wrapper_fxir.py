@@ -86,12 +86,18 @@ log = logging.getLogger(__name__)
 @dataclasses.dataclass
 class SymbolBuffer(CodegenSymbol):
     """
-    Represents a sympy.Symbol graph input.
+    Represents a symbolic graph input. Expressions more complex than a single
+    sympy.Symbol require a name.
     """
 
-    symbol: sympy.Symbol
+    symbol: sympy.Expr
+    name: str | None = None
 
     def get_name(self) -> str:
+        if self.name is not None:
+            return self.name
+        if not isinstance(self.symbol, sympy.Symbol):
+            raise AssertionError(f"expression requires a name: {self.symbol}")
         return str(self.symbol)
 
     def get_example(self) -> torch.Tensor | torch.SymInt:
@@ -412,11 +418,22 @@ class FxConverter:
 
             # Introduce a new symbol for constant inputs.
             is_constant = isinstance(ir_node, (int, float, sympy.Integer, sympy.Float))
-            buffer = (
-                SymbolBuffer(sympy.Symbol(name, is_integer=True))
-                if is_constant
-                else self._get_buffer(ir_node)
+
+            # Special handling for dynamic shapes which are not simple symbols.
+            is_expr = isinstance(ir_node, sympy.Expr) and not isinstance(
+                ir_node, (sympy.Symbol, sympy.Integer, sympy.Float)
             )
+            if is_expr and ir_node.is_integer is not True:
+                raise NotImplementedError(
+                    f"Unsupported non-integer symbolic graph input: {ir_node}"
+                )
+
+            if is_constant:
+                buffer = SymbolBuffer(sympy.Symbol(name, is_integer=True))
+            elif is_expr:
+                buffer = SymbolBuffer(ir_node, name=name)
+            else:
+                buffer = self._get_buffer(ir_node)
             placeholder_node = self.gm.graph.placeholder(buffer.get_name())
             placeholder_node.meta["val"] = (
                 ir_node if is_constant else buffer.get_example()
@@ -424,7 +441,7 @@ class FxConverter:
             self._record_allocation(buffer, placeholder_node)
 
             # Record symbol definitions for dynamic shapes.
-            if isinstance(ir_node, sympy.Symbol):
+            if isinstance(ir_node, sympy.Symbol) or is_expr:
                 self._generate_size_proxy(placeholder_node, ir_node)
 
     def _generate_graph_input_shapes(self) -> None:
@@ -672,11 +689,60 @@ class FxConverter:
         )
         return self.expr_to_proxy[expr]
 
+    def _define_symbol_from_compound_input(self, symbol: sympy.Symbol) -> bool:
+        """
+        Define a symbol that only enters the graph inside a compound input.
+
+        A compound symbolic input is bound whole, so its symbols get no node of
+        their own, but kernels take the free symbols as arguments. Recover one
+        by solving the bound expression for it. Returns whether it worked.
+        """
+
+        def undefined(expr: sympy.Expr) -> list[sympy.Symbol]:
+            return [s for s in expr.free_symbols if s not in self.expr_to_proxy]
+
+        candidates = [
+            expr
+            for expr in self.graph_inputs.values()
+            if isinstance(expr, sympy.Expr)
+            and expr in self.expr_to_proxy
+            and undefined(expr) == [symbol]
+        ]
+        if len(candidates) != 1:
+            return False
+        expr = candidates[0]
+
+        # A Dummy cannot collide with a graph symbol; unlike a tensor size,
+        # this value may be negative.
+        proxy = self.expr_to_proxy[expr]
+        value = sympy.Dummy(proxy.node.name, integer=True)
+
+        solution = try_solve(sympy.Eq(expr, value), symbol)
+        if solution is None:
+            return False
+
+        # Dividing by another symbol determines nothing when that symbol is
+        # zero, so only accept a denominator that cannot be.
+        symbol_expr = solution[1]
+        if sympy.together(symbol_expr).as_numer_denom()[1].is_zero is not False:
+            return False
+
+        if symbol.is_integer:
+            symbol_expr = replace_floor_div(sympy.floor(symbol_expr))
+
+        # Registered only now, so a rejected solution leaves nothing behind.
+        self.expr_to_proxy[value] = proxy
+        self._sympy_interp(symbol_expr)
+        self.expr_to_proxy[symbol] = self.expr_to_proxy[symbol_expr]
+        return True
+
     def _generate_sym_node(self, s: int | sympy.Expr) -> int | torch.fx.Node:
         if isinstance(s, (int, sympy.Integer)):
             return int(s)
         elif isinstance(s, sympy.Symbol):
-            if s not in self.expr_to_proxy:
+            if s not in self.expr_to_proxy and not (
+                self._define_symbol_from_compound_input(s)
+            ):
                 raise AssertionError(
                     f"Could not find a node corresponding to the symbol {s}"
                 )

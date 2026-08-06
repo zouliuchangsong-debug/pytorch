@@ -1373,6 +1373,52 @@ def forward(self, arg0_1, arg1_1, arg2_1):
 
         self.check(TestModule(), (data, offsets))
 
+    def test_compound_symint_graph_input(self):
+        """A compound symbolic graph input binds to a single placeholder.
+
+        The branches close over 2 * y.shape[0] + 1, so the lifted argument
+        reaches the converter as a sympy.Add rather than a single Symbol.
+        """
+
+        class M(torch.nn.Module):
+            def forward(self, x, y):
+                a = 2 * y.shape[0] + 1
+
+                def true_fn(t):
+                    return t + a
+
+                # Identical branches would share one Triton kernel between
+                # two separately converted subgraphs, which FX conversion
+                # cannot resolve.
+                def false_fn(t):
+                    return t + a + 1
+
+                return torch.cond(x.shape[0] > 5, true_fn, false_fn, (x,))
+
+        inp = tuple(torch.randn(numel, device=self.device) for numel in (8, 4))
+        gm = self.check(M(), inp, dynamic_shapes=({0: Dim.DYNAMIC}, {0: Dim.DYNAMIC}))
+
+        # The lifted argument is a placeholder of the branch subgraphs, not of
+        # the parent graph. Check each branch on its own: one symbolic
+        # placeholder holding the whole expression, so neither branch fell back
+        # to taking the constituent symbol instead.
+        branches = [
+            submod
+            for name, submod in gm.named_modules()
+            if name and isinstance(submod, torch.fx.GraphModule)
+        ]
+        self.assertEqual(len(branches), 2, "expected the two cond subgraphs")
+        for branch in branches:
+            symbolic = [
+                node.meta["val"]
+                for node in branch.graph.find_nodes(op="placeholder")
+                if isinstance(node.meta.get("val"), torch.SymInt)
+            ]
+            self.assertEqual(len(symbolic), 1)
+            expr = symbolic[0].node.expr
+            (sym,) = expr.free_symbols
+            self.assertEqual(expr, 2 * sym + 1)
+
 
 class TestReplaceFloorDiv(InductorTestCase):
     """
