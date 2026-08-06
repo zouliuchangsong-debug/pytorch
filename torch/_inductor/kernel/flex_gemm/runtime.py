@@ -715,6 +715,14 @@ def gemm_epilogue(
     expected_dtype = out_dtype
     if expected_dtype is None:
         expected_dtype = out.dtype if out is not None else a.dtype
+    if (
+        output_contraction is None
+        and not expected_dtype.is_floating_point
+        and expected_dtype != torch.bool
+    ):
+        raise NotImplementedError(
+            "FlexGEMM generic main outputs support only floating-point and bool dtypes"
+        )
     effective_C = normalize_c(C, physical_output_shape, beta)
     if out is not None:
         check_matrix("out", out)
