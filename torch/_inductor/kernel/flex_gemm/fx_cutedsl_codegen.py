@@ -13,6 +13,8 @@ import dataclasses
 import hashlib
 from typing import Any
 
+from sympy import Max, Min
+
 import torch
 from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
     CuteDSLCSEVariable,
@@ -42,6 +44,8 @@ from torch._inductor.kernel.flex_gemm.constraints import (
 from torch._inductor.kernel.flex_gemm.quack_reductions import (
     _cute_arg,
     _cute_call,
+    _cute_op_name,
+    _keepdim_and_broadcast,
     _local_reduce_store_arg,
     FlexGemmPhysicalReduction,
     GroupedTensorSSALayout,
@@ -98,7 +102,46 @@ class FlexGemmOutputPlan(_epilogue_analysis.GemmOutputPlan):
 FlexGemmCuteDSLKernel = GemmEpilogueCuteDSLKernel
 
 
-FlexGemmCuteDSLOpOverrides = GemmEpilogueCuteDSLOpOverrides
+class FlexGemmCuteDSLOpOverrides(GemmEpilogueCuteDSLOpOverrides):
+    """Add FlexGEMM-specific NaN-propagating min/max semantics."""
+
+    @staticmethod
+    def nan_propagating_minmax(a: Any, b: Any, op: str) -> Any:
+        """Apply an IEEE min or max that propagates NaN in one operation."""
+        match op:
+            case "min":
+                op_name, index_expr_fn = "min", Min
+            case "max":
+                op_name, index_expr_fn = "max", Max
+            case _:
+                raise AssertionError(f"unexpected minmax op: {op}")
+        return GemmEpilogueCuteDSLOpOverrides._apply_binary_op(
+            a,
+            b,
+            f"cutlass_math.{op_name}({{a}}, {{b}}, propagate_nan=True)",
+            index_expr_fn,
+        )
+
+    @staticmethod
+    def clamp(x: Any, min: Any = None, max: Any = None) -> Any:
+        result = x
+        if min is not None:
+            result = FlexGemmCuteDSLOpOverrides.nan_propagating_minmax(
+                result, min, "max"
+            )
+        if max is not None:
+            result = FlexGemmCuteDSLOpOverrides.nan_propagating_minmax(
+                result, max, "min"
+            )
+        return result
+
+    @staticmethod
+    def clamp_min(x: Any, min: Any) -> Any:
+        return FlexGemmCuteDSLOpOverrides.nan_propagating_minmax(x, min, "max")
+
+    @staticmethod
+    def clamp_max(x: Any, max: Any) -> Any:
+        return FlexGemmCuteDSLOpOverrides.nan_propagating_minmax(x, max, "min")
 
 
 def tuple_output_plan(
@@ -637,6 +680,60 @@ class FlexGemmEpilogueEmitter:
             return
         self.env[node] = lowered_reduce
 
+    def lower_compact_inline_asm(self, node: torch.fx.Node) -> bool:
+        """Apply inline asm before broadcasting a compact reduction value."""
+        if (
+            self.feed_main is not None
+            or _cute_op_name(node.target) != "inline_asm_elementwise"
+            or not is_shape_preserving_pointwise_node(node)
+        ):
+            return False
+        tensor_inputs = [
+            input_node
+            for input_node in node.all_input_nodes
+            if tensor_meta_shape(input_node) is not None
+        ]
+        if len(tensor_inputs) != 1:
+            return False
+        source = tensor_inputs[0]
+        normalized = self.graph.normalized_nodes.get(source)
+        env = self.env
+        if not isinstance(normalized, NormalizedReduction):
+            if not is_shape_preserving_pointwise_node(source):
+                return False
+            source_inputs = [
+                input_node
+                for input_node in source.all_input_nodes
+                if tensor_meta_shape(input_node) is not None
+            ]
+            if len(source_inputs) != 1:
+                return False
+            normalized = self.graph.normalized_nodes.get(source_inputs[0])
+            if not isinstance(normalized, NormalizedReduction):
+                return False
+            source_args = tuple(_cute_arg(arg, self.env) for arg in source.args)
+            source_kwargs = {
+                key: _cute_arg(value, self.env) for key, value in source.kwargs.items()
+            }
+            env = dict(self.env)
+            env[source] = _cute_call(
+                source.target, source_args, source_kwargs, node=source
+            )
+        reduction_input = normalized.source
+        layout = self.grouped_tensors.get(reduction_input)
+        if layout is None:
+            return False
+        node_args = tuple(_cute_arg(arg, env) for arg in node.args)
+        node_kwargs = {key: _cute_arg(value, env) for key, value in node.kwargs.items()}
+        self.env[node] = _cute_call(node.target, node_args, node_kwargs, node=node)
+        _, self.store_sources[node] = _keepdim_and_broadcast(
+            self.kernel,
+            self.env[node],
+            layout,
+            _cute_arg(reduction_input, self.env),
+        )
+        return True
+
     def lower_pointwise_store(self, node: torch.fx.Node) -> bool:
         """Lower pointwise expressions that consume a compressed store value."""
         if (
@@ -656,7 +753,7 @@ class FlexGemmEpilogueEmitter:
             key: _local_reduce_store_arg(value, self.env, self.store_sources)
             for key, value in node.kwargs.items()
         }
-        self.env[node] = _cute_call(node.target, store_args, store_kwargs)
+        self.env[node] = _cute_call(node.target, store_args, store_kwargs, node=node)
         self.store_sources[node] = self.env[node]
         return True
 
@@ -691,7 +788,7 @@ class FlexGemmEpilogueEmitter:
         kwargs = {
             key: self.physical_finalize_arg(value) for key, value in node.kwargs.items()
         }
-        finalize_expr = _cute_call(node.target, args, kwargs)
+        finalize_expr = _cute_call(node.target, args, kwargs, node=node)
         if not isinstance(finalize_expr, str):
             raise NotImplementedError(LOCAL_REDUCE_FINALIZE_SCALAR_ONLY_ERROR)
         self.store_sources[node] = self.store_sources[base]
@@ -788,13 +885,13 @@ class FlexGemmEpilogueEmitter:
             if physical_finalize is not None:
                 self.env[node] = physical_finalize
                 return
-        if self.lower_pointwise_store(node):
+        if self.lower_compact_inline_asm(node) or self.lower_pointwise_store(node):
             return
         node_args = tuple(_cute_arg(arg, self.env) for arg in node.args)
         node_kwargs = {
             key: _cute_arg(value, self.env) for key, value in node.kwargs.items()
         }
-        self.env[node] = _cute_call(node.target, node_args, node_kwargs)
+        self.env[node] = _cute_call(node.target, node_args, node_kwargs, node=node)
 
     def lower_graph(self) -> None:
         """Lower body nodes in FX topological order."""
@@ -824,6 +921,8 @@ class FlexGemmEpilogueEmitter:
 
     def render(self) -> tuple[str, str]:
         """Render the generated epilogue and physical callback source."""
+        from torch._inductor.codegen.cutedsl.inline_asm import inline_asm_cache_key
+
         body = "\n".join(f"    {line}" for line in self.kernel.body.lines)
         if body:
             body += "\n"
@@ -859,6 +958,7 @@ class FlexGemmEpilogueEmitter:
             )
         )
         key_payload = (
+            f"inline_asm={inline_asm_cache_key()}\n"
             f"fast_math={self.fast_math}\n{self.graph_module.code}\n"
             f"{body}\nreturn {result}{physical_reduction_payload}"
         )
@@ -881,7 +981,11 @@ class FlexGemmEpilogueEmitter:
             "import cutlass\n"
             "import cutlass.cute as cute\n"
             "import operator\n"
-            "from cutlass._mlir.dialects import math as mlir_math\n\n"
+            "from cutlass._mlir.dialects import math as mlir_math\n"
+            "from cutlass._mlir_helpers import math as cutlass_math\n"
+            "from torch._inductor.codegen.cutedsl.inline_asm import (\n"
+            "    inline_asm_elementwise_intrinsic,\n"
+            ")\n\n"
             f"{local_reduce_source}"
             f"@cute.jit\ndef {name}({epilogue_params}):\n"
             f"{body}    return {result}\n",
